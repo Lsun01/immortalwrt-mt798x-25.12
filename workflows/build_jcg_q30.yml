@@ -1,0 +1,141 @@
+name: Build ImmortalWrt 25.12 for JCG Q30
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '是否发布到 Releases (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  build:
+    name: Build JCG Q30 Firmware
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Current Date
+        id: date
+        run: echo "date=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /etc/mysql /var/lib/mysql
+          sudo rm -rf /usr/local/lib/android /opt/ghc
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mysql* php*
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          df -h
+
+      - name: Install Build Dependencies
+        run: |
+          sudo -E apt-get update
+          sudo -E apt-get -y install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file \
+            wget subversion patch libfuse-dev ecj fastjar autoconf automake libtool autopoint vim
+          sudo -E apt-get clean
+
+      - name: Clone Source Code
+        run: |
+          git clone https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git openwrt -b 25.12
+          cd openwrt
+          
+          # 更新 feeds
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Inject Reconstructed PBR & Custom Packages
+        run: |
+          echo "Injecting reconstructed PBR from router..."
+          # 覆盖核心业务启动与后台管理脚本
+          if [ -d custom_packages/pbr/files ]; then
+            chmod +x custom_packages/pbr/files/etc/init.d/pbr || true
+            find openwrt/ -type d -name "pbr" -path "*/packages/*" 2>/dev/null | while read -r p; do
+              if [ -d "$p/files" ]; then
+                cp -rf custom_packages/pbr/files/* "$p/files/"
+                echo "Injected into $p/files/"
+              fi
+            done
+            mkdir -p openwrt/package/feeds/packages/pbr/files/
+            cp -rf custom_packages/pbr/files/* openwrt/package/feeds/packages/pbr/files/
+            echo "Successfully injected pbr service files."
+          fi
+          # 覆盖 LuCI 前端视图资源
+          if [ -d custom_packages/luci-app-pbr/htdocs ]; then
+            find openwrt/ -type d -name "luci-app-pbr" 2>/dev/null | while read -r p; do
+              if [ -d "$p/htdocs" ]; then
+                cp -rf custom_packages/luci-app-pbr/htdocs/* "$p/htdocs/"
+                echo "Injected into $p/htdocs/"
+              fi
+            done
+            mkdir -p openwrt/package/feeds/luci/luci-app-pbr/htdocs/
+            cp -rf custom_packages/luci-app-pbr/htdocs/* openwrt/package/feeds/luci/luci-app-pbr/htdocs/
+            echo "Successfully injected luci-app-pbr frontend files."
+          fi
+
+      - name: Load Custom Configuration
+        run: |
+          cd openwrt
+          if [ -f ../defconfig/jcg_q30.config ]; then
+            cp -f ../defconfig/jcg_q30.config .config
+          elif [ -f defconfig/jcg_q30.config ]; then
+            cp -f defconfig/jcg_q30.config .config
+          else
+            echo "Warning: jcg_q30.config not found, using rax3000m-360T7 fallback"
+            cp -f ../defconfig/rax3000m-360T7.config .config
+          fi
+          
+          # 展开并校准配置
+          make defconfig
+
+      - name: Download Package Dependencies
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile Firmware
+        id: compile
+        run: |
+          cd openwrt
+          echo "Building with $(nproc) threads..."
+          make -j$(nproc) || make -j1 V=s
+          echo "status=success" >> $GITHUB_OUTPUT
+          
+          # 整理固件输出目录
+          mkdir -p ../firmware_output
+          cp -f bin/targets/mediatek/filogic/*q30* ../firmware_output/ 2>/dev/null || cp -f bin/targets/mediatek/filogic/* ../firmware_output/ 2>/dev/null || true
+          rm -rf ../firmware_output/packages 2>/dev/null || true
+
+      - name: Upload Firmware to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-25.12-JCG-Q30-${{ steps.date.outputs.date }}
+          path: firmware_output/
+          if-no-files-found: warn
+
+      - name: Create Release and Upload Assets
+        if: steps.compile.outputs.status == 'success' && github.event.inputs.release != 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "JCG Q30 固件 (MT7981 闭源驱动 25.12) #${{ github.run_number }}"
+          tag_name: "release-jcg-q30-${{ steps.date.outputs.date }}"
+          body: |
+            ## ImmortalWrt 25.12 JCG Q30 专属云编译固件
+            
+            - **构建时间**：${{ steps.date.outputs.date }}
+            - **适配机型**：JCG Q30 / JCG Q30 PRO (MT7981 / Filogic 820)
+            - **无线驱动**：MTK 原厂闭源 WiFi 驱动 (7673 + 20250408 固件，彻底修复 WED 异常断流)
+            - **硬件加速**：MTK WARP / WED v2 + HNAT 双 PPE 硬件加速
+            - **精准流量统计**：开启 Conntrack 硬件流表计数回读，集成 `luci-app-nlbwmon`
+            - **策略路由**：内置重构版 `pbr` + `luci-app-pbr`（支持多 WAN 负载与动态域名 `nftset` 自动注入）
+            - **代理工具**：内置 `luci-app-passwall` + `xray-core` + `sing-box`
+            - **Web 管理界面**：Argon 高级主题 + TTYD 终端
+          files: firmware_output/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
